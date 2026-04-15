@@ -6,17 +6,20 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 from urllib.parse import urljoin
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from mempalace.miner import add_drawer
+import db as journal_db
+import memory_items as memory_catalog
+import memory_extract
+import memory_facts
 from mempalace.palace import get_collection
 from mempalace.searcher import search_memories
 
@@ -27,18 +30,82 @@ PALACE_PATH = os.environ.get(
     str(Path(__file__).resolve().parent / "data" / "palace"),
 )
 WING = "smart-journal"
-ROOM = "journal"
 AGENT = "smart-journal-api"
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+JOURNAL_DB_PATH = os.environ.get(
+    "JOURNAL_DB_PATH",
+    str(Path(__file__).resolve().parent / "data" / "journal.sqlite"),
+)
 
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=16_000)
+    session_id: str = Field(
+        ...,
+        min_length=8,
+        description="Client-generated id for this diary session (new on each page load).",
+    )
+    journal_date: str = Field(
+        ...,
+        description="Calendar day for this entry (YYYY-MM-DD). Must be today to write.",
+    )
+    use_memory: bool = Field(
+        False,
+        description="If true, retrieve related passages from MemPalace for this message.",
+    )
 
 
 class ChatResponse(BaseModel):
     reply: str
+
+
+class JournalMessageOut(BaseModel):
+    id: int
+    role: str
+    content: str
+    created_at: str
+
+
+class JournalDayListResponse(BaseModel):
+    days: list[str]
+
+
+class JournalSessionOut(BaseModel):
+    session_id: str
+    journal_date: str
+    started_at: str
+
+
+class JournalSessionListResponse(BaseModel):
+    sessions: list[JournalSessionOut]
+
+
+class JournalMessagesResponse(BaseModel):
+    session_id: str
+    journal_date: str | None
+    messages: list[JournalMessageOut]
+
+
+class MemoryItemOut(BaseModel):
+    drawer_id: str
+    wing: str
+    room: str
+    hall: str | None = None
+    preview: str
+    text: str
+    source_file: str | None = None
+    filed_at: str | None = None
+    added_by: str | None = None
+
+
+class MemoryListResponse(BaseModel):
+    items: list[MemoryItemOut]
+    total: int
+
+
+class DeleteMemoryRequest(BaseModel):
+    drawer_id: str = Field(..., min_length=1)
 
 
 def ensure_palace() -> None:
@@ -64,11 +131,19 @@ def format_mempalace_context(search: dict) -> str:
 
 
 def generate_reply(user_message: str, mempalace_context: str) -> str:
-    system = (
-        "You are a thoughtful journaling companion for Smart Journal. "
-        "Be warm, concise, and helpful. If prior journal context is provided, "
-        "use it naturally without quoting it verbatim unless asked."
-    )
+    if mempalace_context:
+        system = (
+            "You are a thoughtful journaling companion for Smart Journal. "
+            "The user chose to connect this message with older journal memories (shown below). "
+            "Use them only where they help; be warm and concise."
+        )
+    else:
+        system = (
+            "You are a thoughtful journaling companion for Smart Journal. "
+            "Respond to what they wrote right now in this conversation. "
+            "Do not bring up older diary entries, past days, or memories unless the user explicitly asks you to — "
+            "they are not providing that context for this turn."
+        )
     user_parts: list[str] = []
     if mempalace_context:
         user_parts.append(
@@ -127,25 +202,43 @@ def generate_reply(user_message: str, mempalace_context: str) -> str:
     return content
 
 
-def save_user_message_to_palace(text: str) -> None:
-    collection = get_collection(PALACE_PATH, create=True)
-    source = str(Path(PALACE_PATH) / "journal_entries.md")
-    chunk_index = int(time.time_ns() % (2**31))
-    add_drawer(
-        collection=collection,
-        wing=WING,
-        room=ROOM,
-        content=text.strip(),
-        source_file=source,
-        chunk_index=chunk_index,
-        agent=AGENT,
-    )
+def parse_ymd(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail="journal_date must be YYYY-MM-DD.",
+        ) from e
+
+
+def assert_writable_day(journal_date: str) -> None:
+    """Only today's session accepts new messages (journal semantics)."""
+    jd = parse_ymd(journal_date)
+    today = date.today()
+    if jd != today:
+        raise HTTPException(
+            status_code=400,
+            detail="Past days are read-only. You can only write in today's journal.",
+        )
+
+
+def assert_session_journal_date(
+    session_id: str, journal_date: str, existing: str | None
+) -> None:
+    if existing is not None and existing != journal_date:
+        raise HTTPException(
+            status_code=400,
+            detail="This session already belongs to a different calendar day.",
+        )
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     logging.basicConfig(level=logging.INFO)
+    journal_db.init_db(JOURNAL_DB_PATH)
     ensure_palace()
+    logger.info("Journal DB: %s", JOURNAL_DB_PATH)
     logger.info("MemPalace storage path: %s", PALACE_PATH)
     logger.info("Ollama: %s model=%s", OLLAMA_BASE_URL, OLLAMA_MODEL)
     yield
@@ -167,28 +260,132 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/memory/items", response_model=MemoryListResponse)
+def list_memory_items(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> MemoryListResponse:
+    ensure_palace()
+    raw, total = memory_catalog.list_drawer_items(
+        PALACE_PATH, limit=limit, offset=offset
+    )
+    return MemoryListResponse(
+        items=[MemoryItemOut(**r) for r in raw],
+        total=total,
+    )
+
+
+@app.post("/memory/delete")
+def delete_memory_item(body: DeleteMemoryRequest) -> dict[str, bool]:
+    ensure_palace()
+    ok = memory_catalog.delete_drawer(PALACE_PATH, body.drawer_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Memory entry not found.")
+    return {"ok": True}
+
+
+@app.get("/journal/days", response_model=JournalDayListResponse)
+def list_journal_days() -> JournalDayListResponse:
+    days = journal_db.list_days(JOURNAL_DB_PATH)
+    return JournalDayListResponse(days=days)
+
+
+@app.get("/journal/sessions", response_model=JournalSessionListResponse)
+def list_journal_sessions() -> JournalSessionListResponse:
+    raw = journal_db.list_sessions(JOURNAL_DB_PATH)
+    return JournalSessionListResponse(
+        sessions=[
+            JournalSessionOut(
+                session_id=r["session_id"],
+                journal_date=r["journal_date"],
+                started_at=r["started_at"],
+            )
+            for r in raw
+        ],
+    )
+
+
+@app.delete("/journal/session/{session_id}")
+def delete_journal_session(session_id: str) -> dict[str, bool | int]:
+    n = journal_db.delete_session(JOURNAL_DB_PATH, session_id)
+    if n == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="No messages found for this session.",
+        )
+    return {"ok": True, "deleted": n}
+
+
+@app.get("/journal/session/{session_id}", response_model=JournalMessagesResponse)
+def get_journal_session(session_id: str) -> JournalMessagesResponse:
+    rows = journal_db.get_messages_by_session(JOURNAL_DB_PATH, session_id)
+    if not rows:
+        return JournalMessagesResponse(
+            session_id=session_id,
+            journal_date=None,
+            messages=[],
+        )
+    jd = rows[0]["journal_date"]
+    return JournalMessagesResponse(
+        session_id=session_id,
+        journal_date=jd,
+        messages=[
+            JournalMessageOut(
+                id=r["id"],
+                role=r["role"],
+                content=r["content"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ],
+    )
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(body: ChatRequest) -> ChatResponse:
     user_text = body.message.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
+    assert_writable_day(body.journal_date)
+
+    existing_jd = journal_db.get_session_journal_date(JOURNAL_DB_PATH, body.session_id)
+    assert_session_journal_date(body.session_id, body.journal_date, existing_jd)
+
     ensure_palace()
 
-    search = search_memories(
-        query=user_text,
-        palace_path=PALACE_PATH,
-        wing=WING,
-        room=ROOM,
-        n_results=5,
-    )
-    context = format_mempalace_context(search)
+    if body.use_memory:
+        search = search_memories(
+            query=user_text,
+            palace_path=PALACE_PATH,
+            wing=WING,
+            room=None,
+            n_results=5,
+        )
+        context = format_mempalace_context(search)
+    else:
+        context = ""
 
     reply = generate_reply(user_text, context)
 
     try:
-        save_user_message_to_palace(user_text)
+        journal_db.insert_message(
+            JOURNAL_DB_PATH, body.session_id, body.journal_date, "user", user_text
+        )
+        journal_db.insert_message(
+            JOURNAL_DB_PATH, body.session_id, body.journal_date, "assistant", reply
+        )
     except Exception:
-        logger.exception("Failed to save user message to MemPalace")
+        logger.exception("Failed to save journal messages to SQLite")
+
+    try:
+        extracted = memory_extract.extract_key_facts(
+            user_text, OLLAMA_BASE_URL, OLLAMA_MODEL
+        )
+        memory_facts.save_extracted_facts(
+            PALACE_PATH, WING, extracted, AGENT
+        )
+    except Exception:
+        logger.exception("Failed to save extracted facts to MemPalace")
 
     return ChatResponse(reply=reply)

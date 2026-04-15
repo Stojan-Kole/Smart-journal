@@ -7,8 +7,10 @@ frontend (Next.js)  →  POST /chat  →  backend (FastAPI)
                                          ↓
                               MemPalace search → Ollama (llama3.2, …)
                                          ↓
-                              Save user line to MemPalace
+                              SQLite (per-day journal) + MemPalace memory
 ```
+
+Each browser tab / refresh starts a **new session** (`session_id`). You can only **write** in **Current entry** (today). Older sessions in the sidebar are **read-only**.
 
 ## Prerequisites
 
@@ -70,13 +72,17 @@ Use a **colon** before the port:
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama HTTP API |
 | `OLLAMA_MODEL` | `llama3.2` | Model name (`ollama list`) |
 | `MEMPALACE_PATH` | `backend/data/palace` | MemPalace / Chroma storage directory |
+| `JOURNAL_DB_PATH` | `backend/data/journal.sqlite` | SQLite file for messages (grouped by `session_id`) |
 
 ## API
 
-| Method | Path | Body | Response |
-|--------|------|------|----------|
+| Method | Path | Body / query | Response |
+|--------|------|--------------|----------|
 | `GET` | `/health` | — | `{"status":"ok"}` |
-| `POST` | `/chat` | `{"message":"..."}` | `{"reply":"..."}` |
+| `GET` | `/journal/days` | — | `{"days":["YYYY-MM-DD", ...]}` (legacy helper; days that have any message) |
+| `GET` | `/journal/sessions` | — | `{"sessions":[{"session_id","journal_date","started_at"}, ...]}` |
+| `GET` | `/journal/session/{session_id}` | — | `{"session_id","journal_date"|null,"messages":[...]}` |
+| `POST` | `/chat` | JSON: `message`, `session_id`, `journal_date`, optional `use_memory` (default `false`) | `{"reply":"..."}` — MemPalace runs only if `use_memory` is true |
 
 CORS allows `http://localhost:3000`.
 
