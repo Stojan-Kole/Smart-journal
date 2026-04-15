@@ -11,16 +11,27 @@ import httpx
 
 logger = logging.getLogger("smart_journal")
 
-_EXTRACTION_SYSTEM = """You extract only durable, retrievable facts worth remembering from a journal message.
-Respond with JSON exactly in this shape: {"facts": [{"category": "...", "label": "...", "value": "..."}]}
+_EXTRACTION_SYSTEM = """You extract durable personal facts from ONE journal message for long-term memory.
+Return JSON only, exactly: {"facts": [{"category": "...", "label": "...", "value": "..."}]}
 
-Rules:
-- category: short English topic for grouping (e.g. cars, food, family, work, health, preferences, places). Use lowercase; one word or hyphenated (e.g. favourite-things).
-- label: short tag for the type of fact (e.g. "favourite car", "brother's name"). Use English when possible. Use "" if a single standalone fact with no sub-type.
-- value: the concise fact only — no "remember", no narrative wrapping, no repeating the label unnecessarily.
-- One object per distinct fact; merge duplicates in your head into one.
-- If the message is small talk, only questions, or nothing worth long-term recall, return {"facts": []}.
-- Do not invent facts; only what the user clearly stated."""
+Priority when several things appear — extract higher-priority facts first and do not drop them in favour of weaker lines:
+1) Identity: the user's name as they state it (first name or full name).
+2) Origin / location: city, country, or region they say they are from or live in.
+3) Family, work, health, stable preferences, important dates, concrete preferences (e.g. favourite X).
+
+Skip (do not put in facts):
+- Questions to the assistant (e.g. "what can you do?", "can you help?").
+- Pure greetings with no factual content.
+- Meta-comments about this chat app, "trying a new diary tool", or "a new way to journal" unless the user clearly states it as a lasting preference worth recalling. Never prefer such meta over name or place when both appear.
+
+If the user gives name AND location in the same message, you MUST output separate fact objects for both.
+
+category: lowercase English slug — identity, location, family, work, health, preferences, places, cars, food, general, etc.
+label: short English tag — e.g. "given name", "city of origin", "favourite car". Use "" only for a single standalone value.
+value: the fact alone, concise; keep names and place names exactly as stated.
+
+One JSON object per distinct fact. If nothing durable remains after the rules above, return {"facts": []}.
+Do not invent or infer facts not clearly stated."""
 
 
 def _parse_facts_json(raw: str) -> list[dict]:
@@ -69,11 +80,18 @@ def extract_key_facts(user_text: str, ollama_base: str, model: str) -> list[dict
         "model": model,
         "messages": [
             {"role": "system", "content": _EXTRACTION_SYSTEM},
-            {"role": "user", "content": text},
+            {
+                "role": "user",
+                "content": (
+                    "Extract facts from this journal line only "
+                    "(apply priority: name and place before app-related meta):\n\n"
+                    + text
+                ),
+            },
         ],
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.2, "num_predict": 1024},
+        "options": {"temperature": 0.15, "num_predict": 1536},
     }
 
     try:
