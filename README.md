@@ -86,15 +86,6 @@ CORS allows `http://localhost:3000`.
 - **Empty or slow first reply** — First local inference can be slow; ensure RAM is sufficient for the chosen model.
 - **Wrong URL** — Always `http://localhost:3000` (colon `:`), not slash `/`.
 
-## Presenting / demo video (outline)
-
-1. **Intro (30–45 s)** — Problem: journaling + memory; solution stack (Next, FastAPI, MemPalace, Ollama).
-2. **Environment (30 s)** — Terminal: `ollama list`, then start backend + frontend (split terminal or two tabs).
-3. **Browser (60–90 s)** — Open `http://localhost:3000`, send 2–3 messages; show a follow-up that benefits from prior context.
-4. **Optional (30 s)** — `GET /health` or show `backend/data/` (explain it is local only / gitignored).
-5. **Outro (15 s)** — Repo link, “local-only, no cloud LLM cost.”
-
-Record full screen or browser + one terminal; 1080p, clear mic; rehearse once to avoid long waits on first model load.
 
 ## License
 
